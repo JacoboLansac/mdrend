@@ -1,0 +1,334 @@
+use std::borrow::Cow;
+use std::fs;
+use std::hash::{BuildHasher, RandomState};
+use std::path::{Path, PathBuf};
+use std::process::{Command, exit};
+
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use tao::dpi::LogicalSize;
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoop};
+use tao::platform::unix::WindowExtUnix;
+use tao::window::{Theme, WindowBuilder};
+use wry::WebViewBuilderExtUnix;
+use wry::http::Response;
+
+const PAGE: &str = include_str!("page.html");
+const LIGHT: &str = include_str!("../assets/github-markdown-light.css");
+const DARK: &str = include_str!("../assets/github-markdown-dark.css");
+const ORIGIN: &str = "md://localhost";
+/// CSP for every md:// reply that is not the app page: nothing in it may run or load.
+const LOCKED: &str = "default-src 'none'; sandbox";
+const SKIP_DIRS: [&str; 2] = ["node_modules", "target"];
+/// Path chars left as-is in URLs.
+const URL_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/').remove(b'-').remove(b'_').remove(b'.').remove(b'~');
+
+const USAGE: &str = "usage: md [--light|--dark] <file>
+
+Opens <file> rendered GitHub-style. The left tree lists the markdown files
+under the current directory (or the file's folder if it is outside it).
+The theme follows the system unless --light or --dark is given.
+
+Keys: Ctrl+1 tree, Ctrl+2 document. In the tree: Up/Down show docs,
+Left/Right fold folders, Enter opens the doc and moves focus to it.";
+
+fn main() {
+    let mut theme = None;
+    let mut file = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--light" => theme = Some(false),
+            "--dark" => theme = Some(true),
+            "-h" | "--help" => die(USAGE, 0),
+            _ if arg.starts_with('-') => die(&format!("md: unknown option {arg}\n\n{USAGE}"), 2),
+            _ => file = Some(arg),
+        }
+    }
+    let Some(file) = file else { die(USAGE, 2) };
+    let file = fs::canonicalize(&file)
+        .ok()
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| die(&format!("md: {file}: no such file"), 1));
+    let cwd = std::env::current_dir().and_then(fs::canonicalize).unwrap_or_default();
+    let root = if file.starts_with(&cwd) { cwd } else { file.parent().unwrap().to_path_buf() };
+
+    let dark = theme.unwrap_or_else(system_dark);
+    let shell = PAGE
+        .replace("{{theme}}", if dark { "dark" } else { "light" })
+        .replace("{{css}}", if dark { DARK } else { LIGHT })
+        .replace("{{nonce}}", &format!("{:x}", RandomState::new().hash_one(0)))
+        .replace("{{tree}}", &tree_html(&root));
+
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new()
+        .with_title(format!("md — {}", file.file_name().unwrap().to_string_lossy()))
+        .with_theme(Some(if dark { Theme::Dark } else { Theme::Light }))
+        .with_inner_size(LogicalSize::new(1200.0, 900.0))
+        .build(&event_loop)
+        .unwrap_or_else(|e| die(&format!("md: cannot open window: {e}"), 1));
+
+    let (nav_root, ipc_root) = (root.clone(), root.clone());
+    let url = format!("{ORIGIN}/{}", href(file.strip_prefix(&root).unwrap()));
+    // ponytail: Linux only (build_gtk, xdg-open, md:// origin); macOS needs build(&window) and `open`.
+    let _webview = wry::WebViewBuilder::new()
+        .with_custom_protocol("md".into(), move |_, req| serve(&root, &shell, req.uri().path(), req.uri().query()))
+        .with_navigation_handler(move |url| navigate(&nav_root, &url))
+        .with_ipc_handler(move |req| open_link(&ipc_root, req.body()))
+        .with_url(url)
+        .build_gtk(window.default_vbox().unwrap())
+        .unwrap_or_else(|e| die(&format!("md: cannot create webview: {e}"), 1));
+
+    event_loop.run(move |event, _, flow| {
+        *flow = ControlFlow::Wait;
+        if let Event::WindowEvent { event: WindowEvent::CloseRequested, .. } = event {
+            let _ = &window; // keep the window alive for the loop's lifetime
+            *flow = ControlFlow::Exit;
+        }
+    });
+}
+
+fn die(msg: &str, code: i32) -> ! {
+    if code == 0 { println!("{msg}") } else { eprintln!("{msg}") }
+    exit(code)
+}
+
+/// Asks the XDG desktop portal (GNOME, KDE, ...) for the color scheme: 1 = dark.
+fn system_dark() -> bool {
+    use gtk::gio;
+    use gtk::glib::{VariantTy, prelude::ToVariant};
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return false };
+    bus.call_sync(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Settings",
+        "ReadOne",
+        Some(&("org.freedesktop.appearance", "color-scheme").to_variant()),
+        Some(VariantTy::new("(v)").unwrap()),
+        gio::DBusCallFlags::NONE,
+        1000,
+        gio::Cancellable::NONE,
+    )
+    .ok()
+    .and_then(|r| r.child_value(0).as_variant()?.get::<u32>())
+        == Some(1)
+}
+
+/// Answers every md:// request: docs as rendered pages, images as raw bytes.
+fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Response<Cow<'static, [u8]>> {
+    let reply = |status: u16, ctype: &str, body: Vec<u8>| {
+        let r = Response::builder().status(status).header("Content-Type", ctype);
+        // The app page carries its own CSP (meta tag, with the script nonce).
+        let r = if ctype.starts_with("text/html") { r } else { r.header("Content-Security-Policy", LOCKED) };
+        r.body(Cow::Owned(body)).unwrap()
+    };
+    let Some(path) = local_path(root, uri_path).filter(|p| p.is_file()) else {
+        return reply(404, "text/plain", b"Not found".to_vec());
+    };
+    if let Some(ctype) = asset_type(&path) {
+        return match fs::read(&path) {
+            Ok(bytes) => reply(200, ctype, bytes),
+            Err(e) => reply(500, "text/plain", e.to_string().into_bytes()),
+        };
+    }
+    let body = render(&path);
+    if query == Some("body") {
+        // Plain text so a page load of this URL can't run the doc's HTML outside the app's CSP.
+        return reply(200, "text/plain; charset=utf-8", body.into_bytes());
+    }
+    let title = esc(&path.file_name().unwrap().to_string_lossy());
+    // Content goes in last so text inside the doc can't fill the other placeholders.
+    let page = shell.replace("{{title}}", &title).replace("{{content}}", &body);
+    reply(200, "text/html; charset=utf-8", page.into_bytes())
+}
+
+/// Allows page loads of docs under root only. Clicked links never get here: the page's click
+/// handler routes them, so a doc can't launch anything on its own (e.g. with a meta refresh).
+fn navigate(root: &Path, url: &str) -> bool {
+    url == "about:blank"
+        || !url.contains('?') && url_path(root, url).is_some_and(|p| p.is_file() && asset_type(&p).is_none())
+}
+
+/// Clicked links the viewer can't show: web links go to the browser, local images/PDFs to their app.
+fn open_link(root: &Path, url: &str) {
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        open_external(url.as_ref());
+    } else if let Some(p) = url_path(root, url).filter(|p| asset_type(p).is_some()) {
+        open_external(p.as_os_str());
+    }
+}
+
+fn open_external(target: &std::ffi::OsStr) {
+    if let Err(e) = Command::new("xdg-open").arg(target).spawn() {
+        eprintln!("md: xdg-open failed: {e}");
+    }
+}
+
+/// Maps an md:// URL to an existing path under root.
+fn url_path(root: &Path, url: &str) -> Option<PathBuf> {
+    local_path(root, url.strip_prefix(ORIGIN)?.split(['?', '#']).next()?)
+}
+
+/// Maps a URL path to an existing path under root; `..` and symlinks that lead out are rejected.
+fn local_path(root: &Path, uri_path: &str) -> Option<PathBuf> {
+    let rel = percent_decode_str(uri_path).decode_utf8_lossy();
+    fs::canonicalize(root.join(rel.trim_start_matches('/'))).ok().filter(|p| p.starts_with(root))
+}
+
+/// Served raw instead of rendered.
+fn asset_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "pdf" => "application/pdf",
+        _ => return None,
+    })
+}
+
+fn render(path: &Path) -> String {
+    let md = fs::read_to_string(path).unwrap_or_else(|e| format!("**Cannot read `{}`:** {e}", path.display()));
+    let mut o = comrak::Options::default();
+    let x = &mut o.extension;
+    (x.table, x.strikethrough, x.autolink, x.tasklist, x.footnotes, x.alerts) = (true, true, true, true, true, true);
+    x.header_id_prefix = Some(String::new());
+    o.render.tasklist_classes = true; // GitHub CSS hides the bullets of task lists
+    o.render.r#unsafe = true; // raw HTML like GitHub; the page's CSP keeps its scripts from running
+    tagfilter(&comrak::markdown_to_html(&md, &o))
+}
+
+/// GFM's tagfilter (comrak dropped it): escapes raw tags that would swallow the rest of the page.
+/// Safe on the whole output: comrak already escapes `<` in text and code.
+fn tagfilter(html: &str) -> String {
+    const TAGS: [&str; 9] = ["title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "script", "plaintext"];
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let name = rest.strip_prefix('/').unwrap_or(rest);
+        let hit = TAGS.iter().any(|t| {
+            name.get(..t.len()).is_some_and(|n| n.eq_ignore_ascii_case(t))
+                && name[t.len()..].chars().next().is_none_or(|c| c.is_ascii_whitespace() || c == '>' || c == '/')
+        });
+        out.push_str(if hit { "&lt;" } else { "<" });
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_md(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+}
+
+fn tree_html(root: &Path) -> String {
+    let mut out = String::new();
+    walk(root, root, &mut out);
+    format!("<ul>{out}</ul>")
+}
+
+/// Appends `<li>`s for dir's markdown files and for subfolders that contain some.
+/// Returns false when nothing was found.
+// ponytail: walks the whole tree at startup; lazy per-folder loading if huge dirs get slow.
+fn walk(root: &Path, dir: &Path, out: &mut String) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    let mut entries: Vec<_> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref())
+        })
+        .filter_map(|e| Some((e.file_type().ok()?.is_dir(), e.path())))
+        .collect();
+    // Folders first, then case-insensitive by name.
+    entries.sort_by_key(|(is_dir, p)| (!is_dir, p.file_name().unwrap().to_string_lossy().to_lowercase()));
+    let start = out.len();
+    for (is_dir, path) in entries {
+        let name = esc(&path.file_name().unwrap().to_string_lossy());
+        if is_dir {
+            let mut sub = String::new();
+            if walk(root, &path, &mut sub) {
+                out.push_str(&format!("<li><details><summary>{name}</summary><ul>{sub}</ul></details></li>"));
+            }
+        } else if is_md(&path) {
+            let link = href(path.strip_prefix(root).unwrap());
+            out.push_str(&format!("<li><a href=\"/{link}\">{name}</a></li>"));
+        }
+    }
+    out.len() > start
+}
+
+fn href(rel: &Path) -> String {
+    utf8_percent_encode(&rel.to_string_lossy(), URL_SAFE).to_string()
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_paths_serve_navigate() {
+        let root = std::env::temp_dir().join(format!("md-test-{}", std::process::id()));
+        for d in ["b/deep", "a", "empty", ".hidden", "node_modules"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for f in ["Z.md", "b/deep/x.markdown", "a/<y>.md", "a/notes.txt", ".hidden/h.md", "node_modules/n.md", "i.png"] {
+            fs::write(root.join(f), "# hi").unwrap();
+        }
+        let root = fs::canonicalize(&root).unwrap();
+        // Folders first and sorted, files escaped and URL-encoded, junk skipped.
+        assert_eq!(
+            tree_html(&root),
+            "<ul><li><details><summary>a</summary><ul><li><a href=\"/a/%3Cy%3E.md\">&lt;y&gt;.md</a></li></ul></details></li>\
+             <li><details><summary>b</summary><ul><li><details><summary>deep</summary><ul>\
+             <li><a href=\"/b/deep/x.markdown\">x.markdown</a></li></ul></details></li></ul></details></li>\
+             <li><a href=\"/Z.md\">Z.md</a></li></ul>"
+        );
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link.md")).unwrap();
+
+        // Nothing outside root is reachable.
+        assert_eq!(local_path(&root, "/a/%3Cy%3E.md"), Some(root.join("a/<y>.md")));
+        assert_eq!(local_path(&root, "//Z.md"), Some(root.join("Z.md")));
+        assert_eq!(local_path(&root, "/a/../../../../../../etc/passwd"), None);
+        assert_eq!(local_path(&root, "/%2e%2e/%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd"), None);
+        assert_eq!(local_path(&root, "/link.md"), None);
+
+        // Only the app page is HTML; every other reply is locked down.
+        let csp = |r: &Response<Cow<[u8]>>| r.headers().get("Content-Security-Policy").map(|v| v.to_str().unwrap().to_owned());
+        let page = serve(&root, PAGE, "/Z.md", None);
+        let html = String::from_utf8_lossy(page.body());
+        assert!(html.contains("http-equiv=\"Content-Security-Policy\"") && html.contains("<h1 id=\"hi\">hi"), "{html}");
+        let body = serve(&root, PAGE, "/Z.md", Some("body"));
+        assert_eq!(body.headers()["Content-Type"], "text/plain; charset=utf-8");
+        for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None)] {
+            assert_eq!(csp(&r).as_deref(), Some(LOCKED));
+        }
+
+        // Page loads: docs under root only.
+        let nav = |u: &str| navigate(&root, u);
+        assert!(nav("md://localhost/Z.md") && nav("md://localhost/a/%3Cy%3E.md#x") && nav("about:blank"));
+        assert!(!nav("md://localhost/Z.md?body") && !nav("md://localhost/i.png") && !nav("md://localhost/link.md"));
+        assert!(!nav("https://example.com") && !nav("md://localhost/a") && !nav("javascript:alert(1)"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn tagfilter_escapes_page_swallowing_tags() {
+        assert_eq!(
+            tagfilter("<p>a <script>x</script> <scripts> <STYLE>\n<div title=\"t\"><textarea/>é<"),
+            "<p>a &lt;script>x&lt;/script> <scripts> &lt;STYLE>\n<div title=\"t\">&lt;textarea/>é<"
+        );
+    }
+}

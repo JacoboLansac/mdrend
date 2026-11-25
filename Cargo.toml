@@ -1,0 +1,15 @@
+[package]
+name = "mdreader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+comrak = "1.2.0"
+gtk = "0.19"
+percent-encoding = "2.3.2"
+tao = { version = "0.38.0", default-features = false, features = ["rwh_06", "x11"] }
+wry = "0.58.1"
+
+[[bin]]
+name = "md"
+path = "src/main.rs"
