@@ -85,6 +85,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     if (e.ctrlKey && e.key === '2') { e.preventDefault(); content.focus(); return; }
+    if (e.ctrlKey && /^[wq]$/i.test(e.key)) { e.preventDefault(); window.ipc.postMessage('quit'); return; }
     if (!tree.contains(document.activeElement) || e.ctrlKey || e.altKey) return;
     const list = visible(), i = list.indexOf(document.activeElement), el = list[i];
     if (!el) return;
@@ -104,7 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   mark(new URL(location.href));
-  content.focus();
+  location.pathname === '/' ? visible()[0]?.focus() : content.focus(); // no doc open (md <dir>): start in the tree
 });
 </script>
 </head>

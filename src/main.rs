@@ -19,38 +19,47 @@ const DARK: &str = include_str!("../assets/github-markdown-dark.css");
 const ORIGIN: &str = "md://localhost";
 /// CSP for every md:// reply that is not the app page: nothing in it may run or load.
 const LOCKED: &str = "default-src 'none'; sandbox";
-const SKIP_DIRS: [&str; 2] = ["node_modules", "target"];
+/// Dependency, build and cache folders: walking them is slow and their docs are not the user's.
+const SKIP_DIRS: [&str; 9] = [".cache", ".cargo", ".git", ".local", ".npm", ".rustup", ".venv", "node_modules", "target"];
 /// Path chars left as-is in URLs.
 const URL_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/').remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-const USAGE: &str = "usage: md [--light|--dark] <file>
+const USAGE: &str = "usage: md [--light|--dark] <file|dir>
 
 Opens <file> rendered GitHub-style. The left tree lists the markdown files
 under the current directory (or the file's folder if it is outside it).
+With <dir>, opens the tree of <dir> and no document.
 The theme follows the system unless --light or --dark is given.
 
-Keys: Ctrl+1 tree, Ctrl+2 document. In the tree: Up/Down show docs,
-Left/Right fold folders, Enter opens the doc and moves focus to it.";
+Keys: Ctrl+1 tree, Ctrl+2 document, Ctrl+W or Ctrl+Q quit. In the tree:
+Up/Down show docs, Left/Right fold folders, Enter opens the doc and moves
+focus to it.";
 
 fn main() {
     let mut theme = None;
-    let mut file = None;
+    let mut arg_path = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--light" => theme = Some(false),
             "--dark" => theme = Some(true),
             "-h" | "--help" => die(USAGE, 0),
             _ if arg.starts_with('-') => die(&format!("md: unknown option {arg}\n\n{USAGE}"), 2),
-            _ => file = Some(arg),
+            _ => arg_path = Some(arg),
         }
     }
-    let Some(file) = file else { die(USAGE, 2) };
-    let file = fs::canonicalize(&file)
+    let Some(arg_path) = arg_path else { die(USAGE, 2) };
+    let target = fs::canonicalize(&arg_path)
         .ok()
-        .filter(|p| p.is_file())
-        .unwrap_or_else(|| die(&format!("md: {file}: no such file"), 1));
+        .filter(|p| p.is_file() || p.is_dir())
+        .unwrap_or_else(|| die(&format!("md: {arg_path}: no such file or directory"), 1));
     let cwd = std::env::current_dir().and_then(fs::canonicalize).unwrap_or_default();
-    let root = if file.starts_with(&cwd) { cwd } else { file.parent().unwrap().to_path_buf() };
+    let root = if target.is_dir() {
+        target.clone()
+    } else if target.starts_with(&cwd) {
+        cwd
+    } else {
+        target.parent().unwrap().to_path_buf()
+    };
 
     let dark = theme.unwrap_or_else(system_dark);
     let shell = PAGE
@@ -61,19 +70,22 @@ fn main() {
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title(format!("md — {}", file.file_name().unwrap().to_string_lossy()))
+        .with_title(format!("md — {}", name(&target)))
         .with_theme(Some(if dark { Theme::Dark } else { Theme::Light }))
         .with_inner_size(LogicalSize::new(1200.0, 900.0))
         .build(&event_loop)
         .unwrap_or_else(|e| die(&format!("md: cannot open window: {e}"), 1));
 
     let (nav_root, ipc_root) = (root.clone(), root.clone());
-    let url = format!("{ORIGIN}/{}", href(file.strip_prefix(&root).unwrap()));
+    let url = format!("{ORIGIN}/{}", href(target.strip_prefix(&root).unwrap())); // a dir opens md://localhost/
     // ponytail: Linux only (build_gtk, xdg-open, md:// origin); macOS needs build(&window) and `open`.
     let _webview = wry::WebViewBuilder::new()
         .with_custom_protocol("md".into(), move |_, req| serve(&root, &shell, req.uri().path(), req.uri().query()))
         .with_navigation_handler(move |url| navigate(&nav_root, &url))
-        .with_ipc_handler(move |req| open_link(&ipc_root, req.body()))
+        .with_ipc_handler(move |req| match req.body().as_str() {
+            "quit" => exit(0), // Ctrl+W, Ctrl+Q
+            url => open_link(&ipc_root, url),
+        })
         .with_url(url)
         .build_gtk(window.default_vbox().unwrap())
         .unwrap_or_else(|e| die(&format!("md: cannot create webview: {e}"), 1));
@@ -121,31 +133,34 @@ fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Respo
         let r = if ctype.starts_with("text/html") { r } else { r.header("Content-Security-Policy", LOCKED) };
         r.body(Cow::Owned(body)).unwrap()
     };
-    let Some(path) = local_path(root, uri_path).filter(|p| p.is_file()) else {
+    let Some(path) = local_path(root, uri_path).filter(|p| p.is_file() || p == root) else {
         return reply(404, "text/plain", b"Not found".to_vec());
     };
-    if let Some(ctype) = asset_type(&path) {
+    let body = if path == root {
+        "<p>No document open. Pick one in the tree.</p>".to_owned()
+    } else if let Some(ctype) = asset_type(&path) {
         return match fs::read(&path) {
             Ok(bytes) => reply(200, ctype, bytes),
             Err(e) => reply(500, "text/plain", e.to_string().into_bytes()),
         };
-    }
-    let body = render(&path);
+    } else {
+        render(&path)
+    };
     if query == Some("body") {
         // Plain text so a page load of this URL can't run the doc's HTML outside the app's CSP.
         return reply(200, "text/plain; charset=utf-8", body.into_bytes());
     }
-    let title = esc(&path.file_name().unwrap().to_string_lossy());
+    let title = esc(&name(&path));
     // Content goes in last so text inside the doc can't fill the other placeholders.
     let page = shell.replace("{{title}}", &title).replace("{{content}}", &body);
     reply(200, "text/html; charset=utf-8", page.into_bytes())
 }
 
-/// Allows page loads of docs under root only. Clicked links never get here: the page's click
+/// Allows page loads of root (no doc open) and of docs under it. Clicked links never get here: the page's click
 /// handler routes them, so a doc can't launch anything on its own (e.g. with a meta refresh).
 fn navigate(root: &Path, url: &str) -> bool {
     url == "about:blank"
-        || !url.contains('?') && url_path(root, url).is_some_and(|p| p.is_file() && asset_type(&p).is_none())
+        || !url.contains('?') && url_path(root, url).is_some_and(|p| p == root || p.is_file() && asset_type(&p).is_none())
 }
 
 /// Clicked links the viewer can't show: web links go to the browser, local images/PDFs to their app.
@@ -287,18 +302,14 @@ fn walk(root: &Path, dir: &Path, out: &mut String) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };
     let mut entries: Vec<_> = entries
         .flatten()
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref())
-        })
+        .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
         .filter_map(|e| Some((e.file_type().ok()?.is_dir(), e.path())))
         .collect();
     // Folders first, then case-insensitive by name.
     entries.sort_by_key(|(is_dir, p)| (!is_dir, p.file_name().unwrap().to_string_lossy().to_lowercase()));
     let start = out.len();
     for (is_dir, path) in entries {
-        let name = esc(&path.file_name().unwrap().to_string_lossy());
+        let name = esc(&name(&path));
         if is_dir {
             let mut sub = String::new();
             if walk(root, &path, &mut sub) {
@@ -310,6 +321,11 @@ fn walk(root: &Path, dir: &Path, out: &mut String) -> bool {
         }
     }
     out.len() > start
+}
+
+/// Last path component; `/` for the filesystem root.
+fn name(path: &Path) -> Cow<'_, str> {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
 }
 
 fn href(rel: &Path) -> String {
@@ -327,17 +343,18 @@ mod tests {
     #[test]
     fn tree_paths_serve_navigate() {
         let root = std::env::temp_dir().join(format!("md-test-{}", std::process::id()));
-        for d in ["b/deep", "a", "empty", ".hidden", "node_modules"] {
+        for d in ["b/deep", "a", "empty", ".hidden", ".git", "node_modules"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
-        for f in ["Z.md", "b/deep/x.markdown", "a/<y>.md", "a/notes.txt", ".hidden/h.md", "node_modules/n.md", "i.png"] {
+        for f in ["Z.md", "b/deep/x.markdown", "a/<y>.md", "a/notes.txt", ".hidden/h.md", ".git/g.md", "node_modules/n.md", "i.png"] {
             fs::write(root.join(f), "# hi").unwrap();
         }
         let root = fs::canonicalize(&root).unwrap();
-        // Folders first and sorted, files escaped and URL-encoded, junk skipped.
+        // Folders first and sorted (hidden ones too), files escaped and URL-encoded, junk skipped.
         assert_eq!(
             tree_html(&root),
-            "<ul><li><details><summary>a</summary><ul><li><a href=\"/a/%3Cy%3E.md\">&lt;y&gt;.md</a></li></ul></details></li>\
+            "<ul><li><details><summary>.hidden</summary><ul><li><a href=\"/.hidden/h.md\">h.md</a></li></ul></details></li>\
+             <li><details><summary>a</summary><ul><li><a href=\"/a/%3Cy%3E.md\">&lt;y&gt;.md</a></li></ul></details></li>\
              <li><details><summary>b</summary><ul><li><details><summary>deep</summary><ul>\
              <li><a href=\"/b/deep/x.markdown\">x.markdown</a></li></ul></details></li></ul></details></li>\
              <li><a href=\"/Z.md\">Z.md</a></li></ul>"
@@ -356,6 +373,9 @@ mod tests {
         let page = serve(&root, PAGE, "/Z.md", None);
         let html = String::from_utf8_lossy(page.body());
         assert!(html.contains("http-equiv=\"Content-Security-Policy\"") && html.contains("<h1 id=\"hi\">hi"), "{html}");
+        let home = String::from_utf8_lossy(serve(&root, PAGE, "/", None).body()).into_owned();
+        assert!(home.contains("No document open") && !home.contains("{{content}}"), "{home}");
+        assert_eq!(serve(&root, PAGE, "/a", None).status(), 404);
         let body = serve(&root, PAGE, "/Z.md", Some("body"));
         assert_eq!(body.headers()["Content-Type"], "text/plain; charset=utf-8");
         for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None)] {
@@ -364,7 +384,7 @@ mod tests {
 
         // Page loads: docs under root only.
         let nav = |u: &str| navigate(&root, u);
-        assert!(nav("md://localhost/Z.md") && nav("md://localhost/a/%3Cy%3E.md#x") && nav("about:blank"));
+        assert!(nav("md://localhost/Z.md") && nav("md://localhost/a/%3Cy%3E.md#x") && nav("about:blank") && nav("md://localhost/"));
         assert!(!nav("md://localhost/Z.md?body") && !nav("md://localhost/i.png") && !nav("md://localhost/link.md"));
         assert!(!nav("https://example.com") && !nav("md://localhost/a") && !nav("javascript:alert(1)"));
         fs::remove_dir_all(&root).unwrap();
