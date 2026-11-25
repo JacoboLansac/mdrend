@@ -195,13 +195,59 @@ fn asset_type(path: &Path) -> Option<&'static str> {
 
 fn render(path: &Path) -> String {
     let md = fs::read_to_string(path).unwrap_or_else(|e| format!("**Cannot read `{}`:** {e}", path.display()));
+    let (meta, md) = front_matter(&md);
     let mut o = comrak::Options::default();
     let x = &mut o.extension;
     (x.table, x.strikethrough, x.autolink, x.tasklist, x.footnotes, x.alerts) = (true, true, true, true, true, true);
     x.header_id_prefix = Some(String::new());
     o.render.tasklist_classes = true; // GitHub CSS hides the bullets of task lists
     o.render.r#unsafe = true; // raw HTML like GitHub; the page's CSP keeps its scripts from running
-    tagfilter(&comrak::markdown_to_html(&md, &o))
+    meta + &tagfilter(&comrak::markdown_to_html(md, &o))
+}
+
+/// GitHub shows YAML front matter as a table above the doc instead of rendering it as markdown.
+/// Returns that table and the markdown after the front matter.
+// ponytail: top-level `key: value` pairs only; nested lines are appended to the previous value.
+fn front_matter(md: &str) -> (String, &str) {
+    let plain = || (String::new(), md);
+    let mut lines = md.split_inclusive('\n');
+    let Some(first) = lines.next().filter(|l| l.trim_end() == "---") else { return plain() };
+    let mut end = first.len();
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    for line in lines {
+        end += line.len();
+        let t = line.trim();
+        if t == "---" {
+            if rows.is_empty() {
+                return plain();
+            }
+            let (head, body): (String, String) = rows
+                .iter()
+                .map(|(k, v)| {
+                    let v = v.trim();
+                    let v = ['"', '\''].iter().find_map(|q| v.strip_prefix(*q)?.strip_suffix(*q)).unwrap_or(v); // one pair of quotes
+                    (format!("<th>{}</th>", esc(k)), format!("<td>{}</td>", esc(v)))
+                })
+                .unzip();
+            return (format!("<table><thead><tr>{head}</tr></thead><tbody><tr>{body}</tr></tbody></table>\n"), &md[end..]);
+        }
+        if t.is_empty() || t.starts_with('#') {
+            continue; // blank or YAML comment
+        }
+        // `- item` at column 0 only continues a list value (`tools:` then `- Read`).
+        let list_item = line.starts_with('-') && rows.last().is_some_and(|(_, v)| v.trim().is_empty() || v.trim().starts_with('-'));
+        let indented = line.starts_with([' ', '\t']) || list_item;
+        match (indented, line.split_once(':'), rows.last_mut()) {
+            // A key needs `: ` or `:` at line end, so URLs and times in prose don't count.
+            (false, Some((k, v)), _) if v.is_empty() || v.starts_with(char::is_whitespace) => rows.push((k.trim(), v.to_owned())),
+            (true, _, Some((_, v))) => {
+                v.push(' ');
+                v.push_str(t);
+            }
+            _ => return plain(), // prose between two rules, not YAML
+        }
+    }
+    plain() // never closed: not front matter
 }
 
 /// GFM's tagfilter (comrak dropped it): escapes raw tags that would swallow the rest of the page.
@@ -322,6 +368,30 @@ mod tests {
         assert!(!nav("md://localhost/Z.md?body") && !nav("md://localhost/i.png") && !nav("md://localhost/link.md"));
         assert!(!nav("https://example.com") && !nav("md://localhost/a") && !nav("javascript:alert(1)"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn front_matter_becomes_table() {
+        let md = "---\nname: x\ndescription: \"a <b> 'c'\"\n# comment\ntools:\n- Read\n- Write\n---\n# Doc\n";
+        let table = "<table><thead><tr><th>name</th><th>description</th><th>tools</th></tr></thead>\
+                     <tbody><tr><td>x</td><td>a &lt;b&gt; 'c'</td><td>- Read - Write</td></tr></tbody></table>\n";
+        assert_eq!(front_matter(md), (table.to_owned(), "# Doc\n"));
+        let plain = [
+            "# No front matter\n",
+            "---",
+            "---\n---\nhi",
+            "---\nnever: closed\n",
+            "text\n---\n",
+            "---\nA paragraph\n---\n",
+            "---\n# Title\n---\n",
+            "---\nSee https://example.com\n---\n",
+            "---\nMeeting at 10:30 today\n---\n",
+            "---\nStatus: draft\n\nProse here.\n---\n",
+            "---\nStatus: draft\n\n# Heading\n\n- item\n---\n",
+        ];
+        for plain in plain {
+            assert_eq!(front_matter(plain), (String::new(), plain));
+        }
     }
 
     #[test]
