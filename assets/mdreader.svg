@@ -7,9 +7,9 @@
   </defs>
   <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
   <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="2"/>
-  <!-- Markdown mark glyph (CC0, github.com/dcurtis/markdown-mark) -->
-  <g transform="translate(11.5 58.6) scale(1.084)">
-    <path fill="#f0f6fc" d="M30 98V30h20l20 25 20-25h20v68H90V59L70 84 50 59v39z"/>
-    <path fill="#4493f8" d="M155 98l-30-33h20V30h20v35h20z"/>
+  <!-- An M whose right leg is the down arrow; after the Markdown mark (CC0, github.com/dcurtis/markdown-mark) -->
+  <g transform="translate(11 23) scale(1.5)">
+    <path fill="#f0f6fc" d="M30 98V30h20l20 20 20-20v26L70 76 50 56v42z"/>
+    <path fill="#4493f8" d="M90 30h20v50h16l-26 30-26-30h16z"/>
   </g>
 </svg>
