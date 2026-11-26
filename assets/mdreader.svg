@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d444d"/>
+      <stop offset="1" stop-color="#151b23"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="2"/>
+  <!-- Markdown mark glyph (CC0, github.com/dcurtis/markdown-mark) -->
+  <g transform="translate(11.5 58.6) scale(1.084)">
+    <path fill="#f0f6fc" d="M30 98V30h20l20 25 20-25h20v68H90V59L70 84 50 59v39z"/>
+    <path fill="#4493f8" d="M155 98l-30-33h20V30h20v35h20z"/>
+  </g>
+</svg>

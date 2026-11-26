@@ -10,12 +10,16 @@ deps:
 build:
     cargo build --release
 
-# Build and install `md` into ~/.cargo/bin
+# Build and install `md` into ~/.cargo/bin, with its desktop entry and dock icon
 install:
     cargo install --path . --locked
+    install -Dm644 assets/mdreader.svg ~/.local/share/icons/hicolor/scalable/apps/mdreader.svg
+    mkdir -p ~/.local/share/applications
+    sed -e "s|^Exec=md|Exec=${CARGO_HOME:-$HOME/.cargo}/bin/md|" -e "s|^Icon=.*|Icon=$HOME/.local/share/icons/hicolor/scalable/apps/mdreader.svg|" assets/mdreader.desktop > ~/.local/share/applications/mdreader.desktop
 
-# Remove the installed `md`
+# Remove the installed `md`, its desktop entry and icon
 uninstall:
+    rm -f ~/.local/share/applications/mdreader.desktop ~/.local/share/icons/hicolor/scalable/apps/mdreader.svg
     cargo uninstall mdreader
 
 # Open a file with the dev build (path relative to where you call just)
