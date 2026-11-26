@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use gtk::gio::prelude::*;
 use gtk::{gio, glib};
+use ignore::gitignore::Gitignore;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
@@ -28,8 +29,15 @@ const DARK: &str = include_str!("../assets/github-markdown-dark.css");
 const ORIGIN: &str = "md://localhost";
 /// CSP for every md:// reply that is not the app page: nothing in it may run or load.
 const LOCKED: &str = "default-src 'none'; sandbox";
-/// Dependency, build and cache folders: walking them is slow and their docs are not the user's.
-const SKIP_DIRS: [&str; 9] = [".cache", ".cargo", ".git", ".local", ".npm", ".rustup", ".venv", "node_modules", "target"];
+/// Dependency, build and cache folders: walking them is slow and their docs are not the user's. Gitignored folders
+/// are skipped too.
+const SKIP_DIRS: [&str; 26] = [
+    ".cache", ".cargo", ".direnv", ".git", ".gradle", ".local", ".mypy_cache", ".next", ".npm", ".nuxt", ".pnpm-store",
+    ".pytest_cache", ".ruff_cache", ".rustup", ".svelte-kit", ".terraform", ".tox", ".venv", ".yarn", "Pods",
+    "__pycache__", "bower_components", "node_modules", "target", "vendor", "venv",
+];
+/// Walked in full even when gitignored: agents keep their docs there.
+const KEEP_DIR: &str = ".claude";
 /// Path chars left as-is in URLs.
 const URL_SAFE: &AsciiSet = &NON_ALPHANUMERIC.remove(b'/').remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
@@ -210,10 +218,14 @@ fn saved(doc: &Path, e: gio::FileMonitorEvent, other: Option<&Path>) -> bool {
 }
 
 /// Whether a folder event can change the tree: a doc or a folder came, went or was renamed.
+/// A saved .gitignore can show or hide folders.
 fn changes_tree(e: gio::FileMonitorEvent, mut paths: impl Iterator<Item = PathBuf>, watched: impl Fn(&Path) -> bool) -> bool {
     use gio::FileMonitorEvent as E;
-    matches!(e, E::Created | E::Deleted | E::MovedIn | E::MovedOut | E::Renamed)
-        && paths.any(|p| is_md(&p) || p.is_dir() || watched(&p)) // a gone folder is no dir any more, but was watched
+    let moved = matches!(e, E::Created | E::Deleted | E::MovedIn | E::MovedOut | E::Renamed);
+    paths.any(|p| {
+        moved && (is_md(&p) || p.is_dir() || watched(&p)) // a gone folder is no dir any more, but was watched
+            || (moved || e == E::ChangesDoneHint) && p.ends_with(".gitignore")
+    })
 }
 
 /// Rescans a second after the first change of a burst.
@@ -443,35 +455,84 @@ fn is_md(path: &Path) -> bool {
 /// The tree's HTML and every folder walked, for the live reload watches.
 fn tree_html(root: &Path) -> (String, Vec<PathBuf>) {
     let (mut out, mut dirs) = (String::new(), Vec::new());
-    walk(root, root, &mut out, &mut dirs);
+    let mut rules = parent_rules(root, &mut dirs);
+    walk(root, root, &mut out, &mut dirs, &mut rules, obeys(root));
     (format!("<ul>{out}</ul>"), dirs)
 }
 
+/// Whether gitignore rules apply in dir: not in or below KEEP_DIR, unless a repo (a worktree) starts below it.
+fn obeys(dir: &Path) -> bool {
+    for d in dir.ancestors() {
+        if d.join(".git").exists() {
+            return true;
+        }
+        if d.ends_with(KEEP_DIR) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The .gitignore rules of root's parent folders in the same repo, outermost first. Adds those folders to `dirs`,
+/// so saving one of their .gitignore files rebuilds the tree too.
+fn parent_rules(root: &Path, dirs: &mut Vec<PathBuf>) -> Vec<Gitignore> {
+    let Some(repo) = root.ancestors().find(|d| d.join(".git").exists()) else { return Vec::new() };
+    let mut rules = Vec::new();
+    for d in root.ancestors().skip(1).take_while(|d| d.starts_with(repo)) {
+        dirs.push(d.to_path_buf());
+        if d.join(".gitignore").is_file() {
+            rules.push(Gitignore::new(d.join(".gitignore")).0);
+        }
+    }
+    rules.reverse();
+    rules
+}
+
+/// Whether the innermost .gitignore rule that matches the folder ignores it.
+fn ignored(rules: &[Gitignore], dir: &Path) -> bool {
+    rules.iter().rev().map(|g| g.matched(dir, true)).find(|m| !m.is_none()).is_some_and(|m| m.is_ignore())
+}
+
 /// Appends `<li>`s for dir's markdown files and for subfolders that contain some.
-/// Returns false when nothing was found.
+/// Returns false when nothing was found. `rules` holds the .gitignore files that apply to dir, outermost first;
+/// they skip folders only, so gitignored docs (private notes, plans) still show.
 // ponytail: walks the whole tree at startup; lazy per-folder loading if huge dirs get slow.
-fn walk(root: &Path, dir: &Path, out: &mut String, dirs: &mut Vec<PathBuf>) -> bool {
+fn walk(root: &Path, dir: &Path, out: &mut String, dirs: &mut Vec<PathBuf>, rules: &mut Vec<Gitignore>, obey: bool) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };
     dirs.push(dir.to_path_buf());
-    let mut entries: Vec<_> = entries
-        .flatten()
-        .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
-        .filter_map(|e| Some((e.file_type().ok()?.is_dir(), e.path())))
-        .collect();
+    let entries: Vec<_> = entries.flatten().filter_map(|e| Some((e.file_type().ok()?.is_dir(), e.path()))).collect();
+    let has = |n: &str| entries.iter().any(|(_, p)| name(p) == n);
+    // A repo's own rules start fresh (an outer repo's don't reach in); none apply in or below KEEP_DIR, except in
+    // a repo there (a worktree).
+    let mut fresh = Vec::new();
+    let repo = has(".git");
+    let rules = if repo { &mut fresh } else { rules };
+    let obey = repo || obey && !dir.ends_with(KEEP_DIR);
+    let own = obey && has(".gitignore");
+    if own {
+        rules.push(Gitignore::new(dir.join(".gitignore")).0);
+    }
+    let mut entries: Vec<_> = entries.into_iter().filter(|(_, p)| !SKIP_DIRS.contains(&name(p).as_ref())).collect();
     // Folders first, then case-insensitive by name.
     entries.sort_by_key(|(is_dir, p)| (!is_dir, p.file_name().unwrap().to_string_lossy().to_lowercase()));
     let start = out.len();
     for (is_dir, path) in entries {
         let name = esc(&name(&path));
         if is_dir {
+            if obey && !path.ends_with(KEEP_DIR) && ignored(rules, &path) {
+                continue;
+            }
             let mut sub = String::new();
-            if walk(root, &path, &mut sub, dirs) {
+            if walk(root, &path, &mut sub, dirs, rules, obey) {
                 out.push_str(&format!("<li><details><summary>{name}</summary><ul>{sub}</ul></details></li>"));
             }
         } else if is_md(&path) {
             let link = href(path.strip_prefix(root).unwrap());
             out.push_str(&format!("<li><a href=\"/{link}\">{name}</a></li>"));
         }
+    }
+    if own {
+        rules.pop();
     }
     out.len() > start
 }
@@ -607,7 +668,48 @@ mod tests {
         assert!(hit(E::Created, "x.md", false) && hit(E::Deleted, "x.MARKDOWN", false) && hit(E::Renamed, "x.md", false));
         assert!(hit(E::Created, "sub", false) && hit(E::MovedOut, "gone", true));
         assert!(!hit(E::Created, "4913", false) && !hit(E::Deleted, "gone", false) && !hit(E::ChangesDoneHint, "x.md", false));
+        assert!(hit(E::ChangesDoneHint, ".gitignore", false) && !hit(E::Changed, ".gitignore", false));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gitignore_skips_folders_not_docs() {
+        let root = std::env::temp_dir().join(format!("md-gitignore-{}", std::process::id()));
+        for d in [".git", "gen", ".claude/plans/tmp", ".claude/worktrees/wt/build", ".claude/worktrees/wt/tmp/build", "sub/local", "sub/wl"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for d in ["repo/.git", "repo/gen", "vendor", "docs/gen"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        fs::write(root.join(".gitignore"), "gen/\nwl/\ntmp/\n.claude/\n.claude/*\nsecret.md\n").unwrap();
+        fs::write(root.join("sub/.gitignore"), "local/\n!wl/\n").unwrap(); // the inner file wins
+        fs::write(root.join(".claude/.gitignore"), "*\n!.gitignore\n").unwrap();
+        fs::write(root.join(".claude/worktrees/wt/.git"), "gitdir: x").unwrap(); // a worktree obeys its own rules
+        fs::write(root.join(".claude/worktrees/wt/.gitignore"), "build/\n").unwrap();
+        for f in [".claude/worktrees/wt/build/b.md", ".claude/worktrees/wt/tmp/t2.md", ".claude/worktrees/wt/tmp/build/b2.md"] {
+            fs::write(root.join(f), "# hi").unwrap();
+        }
+        for f in ["gen/g.md", ".claude/plans/tmp/t.md", "secret.md", "sub/local/l.md", "sub/s.md", "sub/wl/w.md", "repo/gen/r.md"] {
+            fs::write(root.join(f), "# hi").unwrap();
+        }
+        for f in ["vendor/v.md", "docs/gen/d.md"] {
+            fs::write(root.join(f), "# hi").unwrap();
+        }
+        let root = fs::canonicalize(&root).unwrap();
+        let docs = |tree: &str| tree.split("href=\"").skip(1).map(|s| s.split('"').next().unwrap().to_owned()).collect::<Vec<_>>();
+        // Gitignored and listed folders are skipped at any depth; gitignored docs, .claude and nested repos are not.
+        let (tree, dirs) = tree_html(&root);
+        let want = ["/.claude/plans/tmp/t.md", "/.claude/worktrees/wt/tmp/t2.md", "/repo/gen/r.md", "/sub/wl/w.md", "/sub/s.md", "/secret.md"];
+        assert_eq!(docs(&tree), want);
+        for skipped in ["gen", "sub/local", "vendor", "docs/gen"] {
+            assert!(!dirs.contains(&root.join(skipped)), "{skipped}");
+        }
+        // A root inside the repo still follows the repo's .gitignore and watches its folder; not below .claude.
+        let (tree, dirs) = tree_html(&root.join("docs"));
+        assert!(tree == "<ul></ul>" && dirs[0] == root, "{tree}");
+        assert_eq!(docs(&tree_html(&root.join(".claude/plans")).0), ["/tmp/t.md"]);
+        assert_eq!(docs(&tree_html(&root.join(".claude/worktrees/wt/tmp")).0), ["/t2.md"]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

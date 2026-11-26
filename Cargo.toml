@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 comrak = "1.2.0"
 gtk = "0.19"
+ignore = "0.4.35"
 percent-encoding = "2.3.2"
 tao = { version = "0.38.0", default-features = false, features = ["rwh_06", "x11"] }
 wry = "0.58.1"
