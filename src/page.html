@@ -87,7 +87,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (e.ctrlKey && e.key === '2') { e.preventDefault(); content.focus(); return; }
     if (e.ctrlKey && /^[wq]$/i.test(e.key)) { e.preventDefault(); window.ipc.postMessage('quit'); return; }
-    if (!tree.contains(document.activeElement) || e.ctrlKey || e.altKey) return;
+    if (!tree.contains(document.activeElement) || e.altKey) return;
+    // PageUp/PageDown scroll the doc by a page (WebKit's own step), Ctrl+Up/Down by one text line.
+    const page = content.clientHeight * 0.875, line = parseFloat(getComputedStyle(article).lineHeight);
+    const dy = { PageDown: page, PageUp: -page, ArrowDown: e.ctrlKey && line, ArrowUp: e.ctrlKey && -line }[e.key];
+    if (dy) { e.preventDefault(); content.scrollBy(0, dy); return; }
+    if (e.ctrlKey) return;
     const list = visible(), i = list.indexOf(document.activeElement), el = list[i];
     if (!el) return;
     const dir = el.tagName === 'SUMMARY' ? el.parentElement : null;
