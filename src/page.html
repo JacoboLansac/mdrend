@@ -1,5 +1,5 @@
 <!doctype html>
-<html class="{{theme}}" data-stamp="{{stamp}}">
+<html class="{{theme}}">
 <head>
 <meta charset="utf-8">
 <!-- Markdown may hold raw HTML: only our nonced script runs, no inline handlers, fetches stay local. -->
@@ -39,7 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const isDoc = u => u.protocol === location.protocol && /\.(md|markdown)$/i.test(u.pathname);
   const same = (a, b) => decodeURIComponent(a.pathname) === decodeURIComponent(b.pathname);
   const byId = id => article.querySelector('#' + CSS.escape(id)); // doc headings only, not the shell's ids
-  let current = location.pathname === '/' ? null : location.href, stamp = document.documentElement.dataset.stamp;
+  let current = location.pathname === '/' ? null : location.href;
 
   // Highlight the doc in the tree and expand its parent folders.
   function mark(u) {
@@ -50,11 +50,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Swap in another doc without reloading, so the tree keeps its state.
   // With reload, re-renders the open doc and keeps the scroll position.
   async function show(u, reload) {
+    if (!reload) window.ipc.postMessage('watch ' + u.href); // before the fetch, so no save goes unseen
     current = u.href;
     const res = await fetch(u.pathname + '?body');
     const html = await res.text();
     if (current !== u.href) return; // a newer request won
-    stamp = res.headers.get('x-stamp');
     base.href = u.href; // relative images/links resolve against the doc
     article.innerHTML = html;
     if (reload) return;
@@ -63,14 +63,18 @@ document.addEventListener('DOMContentLoaded', () => {
     target ? target.scrollIntoView() : content.scrollTop = 0;
   }
 
-  // Live reload: poll the open doc's mtime and size, re-render when they change.
-  setInterval(async () => {
-    const u = current;
-    if (!u) return; // no doc open
-    const res = await fetch(new URL(u).pathname + '?stamp');
-    const s = res.ok && await res.text();
-    if (s && u === current && s !== stamp) show(new URL(u), true);
-  }, 300);
+  // Live reload, called by Rust's watches: the open doc was saved, or the tree changed (percent-encoded HTML).
+  window.reload = () => { if (current) show(new URL(current), true); };
+  window.setTree = encoded => {
+    const path = d => { const p = []; for (; d; d = d.parentElement.closest('details')) p.unshift(d.firstElementChild.textContent); return p.join('/'); };
+    const key = el => el.tagName === 'A' ? el.getAttribute('href') : path(el.parentElement); // a doc or a folder
+    const open = new Set([...tree.querySelectorAll('details[open]')].map(path));
+    const focused = tree.contains(document.activeElement) && key(document.activeElement);
+    tree.innerHTML = decodeURIComponent(encoded);
+    for (const d of tree.querySelectorAll('details')) d.open = open.has(path(d));
+    if (current) mark(new URL(current));
+    if (focused !== false) [...tree.querySelectorAll('summary, a')].find(el => key(el) === focused)?.focus();
+  };
 
   // Every link goes through here: docs swap in, anchors scroll, the rest goes to Rust,
   // which opens web links in the browser and local images/PDFs in their app.

@@ -1,11 +1,18 @@
 use std::borrow::Cow;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
-use std::sync::LazyLock;
+use std::rc::Rc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
+use std::time::Duration;
 
+use gtk::gio::prelude::*;
+use gtk::{gio, glib};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
@@ -30,6 +37,7 @@ const USAGE: &str = "usage: md [--light|--dark] <file|dir>
 
 Opens <file> rendered GitHub-style. The left tree lists the markdown files
 under the current directory (or the file's folder if it is outside it).
+Both follow changes on disk: saved docs reload, new docs show up in the tree.
 With <dir>, opens the tree of <dir> and no document.
 The theme follows the system unless --light or --dark is given.
 
@@ -66,12 +74,18 @@ fn main() {
     let dark = theme.unwrap_or_else(system_dark);
     // Big folders take a while to walk: walk while GTK and WebKit start, wait for it on the first request.
     let tree_root = root.clone();
-    let tree = thread::spawn(move || tree_html(&tree_root));
+    let tree = thread::spawn(move || tree_html(&tree_root).0);
+    let watch = Rc::new(Watch { root: root.clone(), ..Default::default() });
+    let sent = watch.tree.clone();
     let shell = LazyLock::new(move || {
-        PAGE.replace("{{theme}}", if dark { "dark" } else { "light" })
+        let tree = tree.join().unwrap();
+        let shell = PAGE
+            .replace("{{theme}}", if dark { "dark" } else { "light" })
             .replace("{{css}}", if dark { DARK } else { LIGHT })
             .replace("{{nonce}}", &format!("{:x}", RandomState::new().hash_one(0)))
-            .replace("{{tree}}", &tree.join().unwrap())
+            .replace("{{tree}}", &tree);
+        *sent.lock().unwrap() = tree;
+        shell
     });
 
     let event_loop = EventLoop::new();
@@ -82,20 +96,37 @@ fn main() {
         .build(&event_loop)
         .unwrap_or_else(|e| die(&format!("md: cannot open window: {e}"), 1));
 
-    let (nav_root, ipc_root) = (root.clone(), root.clone());
+    let (nav_root, ipc_watch, load_watch) = (root.clone(), watch.clone(), watch.clone());
     let url = format!("{ORIGIN}/{}", href(target.strip_prefix(&root).unwrap())); // a dir opens md://localhost/
+    if target.is_file() {
+        watch_doc(&watch, &url); // before the page is served, so no save goes unseen
+    }
     // ponytail: Linux only (build_gtk, xdg-open, md:// origin); macOS needs build(&window) and `open`.
-    let _webview = wry::WebViewBuilder::new()
+    let webview = wry::WebViewBuilder::new()
         .with_custom_protocol("md".into(), move |_, req| serve(&root, &shell, req.uri().path(), req.uri().query()))
         .with_navigation_handler(move |url| navigate(&nav_root, &url))
         .with_ipc_handler(move |req| match req.body().as_str() {
             "quit" => exit(0), // Ctrl+W, Ctrl+Q
-            url => open_link(&ipc_root, url),
+            url => match url.strip_prefix("watch ") {
+                Some(doc) => watch_doc(&ipc_watch, doc), // the page shows another doc
+                None => open_link(&ipc_watch.root, url),
+            },
         })
         .with_url(url)
+        .with_on_page_load_handler(move |e, url| {
+            if matches!(e, wry::PageLoadEvent::Finished) {
+                // A reloaded page shows its URL's doc and the startup tree: watch that doc, send the latest tree.
+                if load_watch.loaded.replace(true) {
+                    watch_doc(&load_watch, &url);
+                    load_watch.tree.lock().unwrap().clear();
+                }
+                rescan(&load_watch)
+            }
+        })
         .with_background_color(if dark { (13, 17, 23, 255) } else { (255, 255, 255, 255) }) // no white flash before the first paint
         .build_gtk(window.default_vbox().unwrap())
         .unwrap_or_else(|e| die(&format!("md: cannot create webview: {e}"), 1));
+    let _ = watch.webview.set(webview);
 
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
@@ -113,7 +144,6 @@ fn die(msg: &str, code: i32) -> ! {
 
 /// Asks the XDG desktop portal (GNOME, KDE, ...) for the color scheme: 1 = dark.
 fn system_dark() -> bool {
-    use gtk::gio;
     use gtk::glib::{VariantTy, prelude::ToVariant};
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return false };
     bus.call_sync(
@@ -132,6 +162,120 @@ fn system_dark() -> bool {
         == Some(1)
 }
 
+/// Live reload, from inotify through GIO, so an idle viewer does no work. The open doc has its own watch and
+/// reloads as soon as a save is done. Every tree folder has one too: new, deleted or renamed docs and folders
+/// rebuild the tree a second later.
+// ponytail: one inotify watch per folder; a root with more folders than fs.inotify.max_user_watches loses the rest.
+#[derive(Default)]
+struct Watch {
+    root: PathBuf,
+    webview: OnceCell<wry::WebView>,
+    doc: RefCell<Option<gio::FileMonitor>>,
+    folders: RefCell<HashMap<PathBuf, gio::FileMonitor>>,
+    tree: Arc<Mutex<String>>, // the page's tree; the first one comes with the page, from the startup walk
+    pending: Cell<bool>,      // a rescan is scheduled
+    walking: Cell<bool>,      // one walk at a time
+    again: Cell<bool>,        // changes came during the walk: walk again after it
+    loaded: Cell<bool>,       // the page loaded once
+}
+
+const MOVES: gio::FileMonitorFlags = gio::FileMonitorFlags::WATCH_MOVES;
+
+/// Watches the doc at an md:// URL; its saves reload the page's doc.
+fn watch_doc(w: &Rc<Watch>, url: &str) {
+    let w2 = w.clone();
+    let doc = url_path(&w.root, url).filter(|p| p.is_file());
+    *w.doc.borrow_mut() = doc.and_then(|doc| on_save(doc, move || run_js(&w2, "reload()")));
+}
+
+fn on_save(doc: PathBuf, f: impl Fn() + 'static) -> Option<gio::FileMonitor> {
+    let m = gio::File::for_path(&doc).monitor_file(MOVES, gio::Cancellable::NONE).ok()?;
+    m.connect_changed(move |_, _, other, e| {
+        if saved(&doc, e, other.and_then(|o| o.path()).as_deref()) {
+            f()
+        }
+    });
+    Some(m)
+}
+
+/// Whether an event on a doc's watch is a finished save: written in place (GIO tells once the writer closes the
+/// file), or moved or renamed over it (vim, most editors, agent tools). Not `Created`: it comes before the content.
+fn saved(doc: &Path, e: gio::FileMonitorEvent, other: Option<&Path>) -> bool {
+    use gio::FileMonitorEvent as E;
+    match e {
+        E::ChangesDoneHint | E::MovedIn => true,
+        E::Renamed => other == Some(doc), // not when the doc itself is renamed away
+        _ => false,
+    }
+}
+
+/// Whether a folder event can change the tree: a doc or a folder came, went or was renamed.
+fn changes_tree(e: gio::FileMonitorEvent, mut paths: impl Iterator<Item = PathBuf>, watched: impl Fn(&Path) -> bool) -> bool {
+    use gio::FileMonitorEvent as E;
+    matches!(e, E::Created | E::Deleted | E::MovedIn | E::MovedOut | E::Renamed)
+        && paths.any(|p| is_md(&p) || p.is_dir() || watched(&p)) // a gone folder is no dir any more, but was watched
+}
+
+/// Rescans a second after the first change of a burst.
+fn schedule(w: &Rc<Watch>) {
+    if !w.pending.replace(true) {
+        let w = w.clone();
+        glib::timeout_add_local_once(Duration::from_secs(1), move || rescan(&w));
+    }
+}
+
+/// Walks the tree off the main thread, watches the new folders, drops the gone ones, and sends the page the tree if
+/// it changed.
+fn rescan(w: &Rc<Watch>) {
+    w.pending.set(false);
+    if w.walking.replace(true) {
+        w.again.set(true);
+        return;
+    }
+    let w = w.clone();
+    glib::spawn_future_local(async move {
+        let root = w.root.clone();
+        let walked = gio::spawn_blocking(move || tree_html(&root)).await;
+        w.walking.set(false);
+        if w.again.replace(false) {
+            schedule(&w);
+        }
+        let Ok((tree, dirs)) = walked else { return };
+        let dirs: HashSet<PathBuf> = dirs.into_iter().collect();
+        let mut folders = w.folders.borrow_mut();
+        folders.retain(|d, _| dirs.contains(d));
+        let mut added = false;
+        for d in dirs {
+            let Entry::Vacant(slot) = folders.entry(d) else { continue };
+            let Ok(m) = gio::File::for_path(slot.key()).monitor_directory(MOVES, gio::Cancellable::NONE) else { continue };
+            let w = w.clone();
+            m.connect_changed(move |_, f, other, e| {
+                let paths = [Some(f), other].into_iter().flatten().filter_map(|f| f.path());
+                if changes_tree(e, paths, |p| w.folders.borrow().contains_key(p)) {
+                    schedule(&w)
+                }
+            });
+            slot.insert(m);
+            added = true;
+        }
+        drop(folders);
+        if added {
+            schedule(&w); // a new folder had no watch while the walk read it: walk again for docs made in it meanwhile
+        }
+        let mut sent = w.tree.lock().unwrap();
+        if *sent != tree {
+            run_js(&w, &format!("setTree('{}')", utf8_percent_encode(&tree, NON_ALPHANUMERIC))); // only [A-Za-z0-9%]
+            *sent = tree;
+        }
+    });
+}
+
+fn run_js(w: &Watch, js: &str) {
+    if let Some(Err(e)) = w.webview.get().map(|v| v.evaluate_script(js)) {
+        eprintln!("md: live reload failed: {e}");
+    }
+}
+
 /// Answers every md:// request: docs as rendered pages, images as raw bytes.
 fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Response<Cow<'static, [u8]>> {
     let reply = |status: u16, ctype: &str, body: Vec<u8>| {
@@ -143,11 +287,6 @@ fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Respo
     let Some(path) = local_path(root, uri_path).filter(|p| p.is_file() || p == root) else {
         return reply(404, "text/plain", b"Not found".to_vec());
     };
-    // Taken before the doc is read: a save during render then shows up as a change on the next poll.
-    let stamp = stamp(&path);
-    if query == Some("stamp") {
-        return reply(200, "text/plain", stamp.into_bytes());
-    }
     let body = if path == root {
         "<p>No document open. Pick one in the tree.</p>".to_owned()
     } else if let Some(ctype) = asset_type(&path) {
@@ -160,14 +299,11 @@ fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Respo
     };
     if query == Some("body") {
         // Plain text so a page load of this URL can't run the doc's HTML outside the app's CSP.
-        let mut r = reply(200, "text/plain; charset=utf-8", body.into_bytes());
-        r.headers_mut().insert("x-stamp", stamp.parse().unwrap());
-        return r;
+        return reply(200, "text/plain; charset=utf-8", body.into_bytes());
     }
     let title = esc(&name(&path));
-    // Content goes in last so text inside the doc can't fill the other placeholders. The first {{stamp}} is on
-    // <html>, ahead of any file name in the tree.
-    let page = shell.replacen("{{stamp}}", &stamp, 1).replace("{{title}}", &title).replace("{{content}}", &body);
+    // Content goes in last so text inside the doc can't fill the other placeholders.
+    let page = shell.replace("{{title}}", &title).replace("{{content}}", &body);
     reply(200, "text/html; charset=utf-8", page.into_bytes())
 }
 
@@ -202,11 +338,6 @@ fn url_path(root: &Path, url: &str) -> Option<PathBuf> {
 fn local_path(root: &Path, uri_path: &str) -> Option<PathBuf> {
     let rel = percent_decode_str(uri_path).decode_utf8_lossy();
     fs::canonicalize(root.join(rel.trim_start_matches('/'))).ok().filter(|p| p.starts_with(root))
-}
-
-/// Changes on every save (mtime and size); the page polls it for live reload.
-fn stamp(path: &Path) -> String {
-    fs::metadata(path).map(|m| format!("{:?} {}", m.modified().ok(), m.len())).unwrap_or_default()
 }
 
 /// Served raw instead of rendered.
@@ -309,17 +440,19 @@ fn is_md(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
 }
 
-fn tree_html(root: &Path) -> String {
-    let mut out = String::new();
-    walk(root, root, &mut out);
-    format!("<ul>{out}</ul>")
+/// The tree's HTML and every folder walked, for the live reload watches.
+fn tree_html(root: &Path) -> (String, Vec<PathBuf>) {
+    let (mut out, mut dirs) = (String::new(), Vec::new());
+    walk(root, root, &mut out, &mut dirs);
+    (format!("<ul>{out}</ul>"), dirs)
 }
 
 /// Appends `<li>`s for dir's markdown files and for subfolders that contain some.
 /// Returns false when nothing was found.
 // ponytail: walks the whole tree at startup; lazy per-folder loading if huge dirs get slow.
-fn walk(root: &Path, dir: &Path, out: &mut String) -> bool {
+fn walk(root: &Path, dir: &Path, out: &mut String, dirs: &mut Vec<PathBuf>) -> bool {
     let Ok(entries) = fs::read_dir(dir) else { return false };
+    dirs.push(dir.to_path_buf());
     let mut entries: Vec<_> = entries
         .flatten()
         .filter(|e| !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
@@ -332,7 +465,7 @@ fn walk(root: &Path, dir: &Path, out: &mut String) -> bool {
         let name = esc(&name(&path));
         if is_dir {
             let mut sub = String::new();
-            if walk(root, &path, &mut sub) {
+            if walk(root, &path, &mut sub, dirs) {
                 out.push_str(&format!("<li><details><summary>{name}</summary><ul>{sub}</ul></details></li>"));
             }
         } else if is_md(&path) {
@@ -371,14 +504,17 @@ mod tests {
         }
         let root = fs::canonicalize(&root).unwrap();
         // Folders first and sorted (hidden ones too), files escaped and URL-encoded, junk skipped.
+        let (tree, dirs) = tree_html(&root);
         assert_eq!(
-            tree_html(&root),
+            tree,
             "<ul><li><details><summary>.hidden</summary><ul><li><a href=\"/.hidden/h.md\">h.md</a></li></ul></details></li>\
              <li><details><summary>a</summary><ul><li><a href=\"/a/%3Cy%3E.md\">&lt;y&gt;.md</a></li></ul></details></li>\
              <li><details><summary>b</summary><ul><li><details><summary>deep</summary><ul>\
              <li><a href=\"/b/deep/x.markdown\">x.markdown</a></li></ul></details></li></ul></details></li>\
              <li><a href=\"/Z.md\">Z.md</a></li></ul>"
         );
+        // Watched for live reload: every walked folder, also those with no docs yet.
+        assert_eq!(dirs, ["", ".hidden", "a", "b", "b/deep", "empty"].map(|d| root.join(d)));
         std::os::unix::fs::symlink("/etc/passwd", root.join("link.md")).unwrap();
 
         // Nothing outside root is reachable.
@@ -398,17 +534,9 @@ mod tests {
         assert_eq!(serve(&root, PAGE, "/a", None).status(), 404);
         let body = serve(&root, PAGE, "/Z.md", Some("body"));
         assert_eq!(body.headers()["Content-Type"], "text/plain; charset=utf-8");
-        for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None), serve(&root, PAGE, "/Z.md", Some("stamp"))] {
+        for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None)] {
             assert_eq!(csp(&r).as_deref(), Some(LOCKED));
         }
-
-        // Live reload: page, body and poll carry the same stamp, and a save changes it.
-        let stamp = || String::from_utf8_lossy(serve(&root, PAGE, "/Z.md", Some("stamp")).body()).into_owned();
-        let s = stamp();
-        assert!(!s.is_empty() && html.contains(&format!("<html class=\"{{{{theme}}}}\" data-stamp=\"{s}\">")), "{s}");
-        assert_eq!(serve(&root, PAGE, "/Z.md", Some("body")).headers()["x-stamp"], s.as_str());
-        fs::write(root.join("Z.md"), "# hi again").unwrap();
-        assert_ne!(stamp(), s);
 
         // Page loads: docs under root only.
         let nav = |u: &str| navigate(&root, u);
@@ -416,6 +544,70 @@ mod tests {
         assert!(!nav("md://localhost/Z.md?body") && !nav("md://localhost/i.png") && !nav("md://localhost/link.md"));
         assert!(!nav("https://example.com") && !nav("md://localhost/a") && !nav("javascript:alert(1)"));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn doc_watch_reloads_finished_saves_only() {
+        let dir = std::env::temp_dir().join(format!("md-watch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let dir = fs::canonicalize(&dir).unwrap();
+        let doc = dir.join("d.md");
+        fs::write(&doc, "v1").unwrap();
+        let ctx = glib::MainContext::new();
+        ctx.with_thread_default(|| {
+            let seen = Rc::new(RefCell::new(Vec::new())); // the doc's content at each reload
+            let (s, d) = (seen.clone(), doc.clone());
+            let _watch = on_save(doc.clone(), move || s.borrow_mut().push(fs::read_to_string(&d).unwrap_or_default())).unwrap();
+            let settle = || {
+                let end = std::time::Instant::now() + Duration::from_millis(300);
+                while std::time::Instant::now() < end {
+                    while ctx.iteration(false) {}
+                    thread::sleep(Duration::from_millis(5));
+                }
+            };
+            let last = || seen.borrow().last().cloned().unwrap_or_default();
+            settle();
+
+            fs::write(&doc, "v2").unwrap(); // in place
+            settle();
+            assert_eq!(last(), "v2");
+            fs::write(dir.join(".d.tmp"), "v3").unwrap(); // rename over: vim, editors, agent tools
+            fs::rename(dir.join(".d.tmp"), &doc).unwrap();
+            settle();
+            assert_eq!(last(), "v3");
+            fs::remove_file(&doc).unwrap(); // deleted, then recreated slowly: no reload until the writer is done
+            let mut f = fs::File::create(&doc).unwrap();
+            std::io::Write::write_all(&mut f, b"v").unwrap();
+            settle();
+            assert_eq!(last(), "v3");
+            std::io::Write::write_all(&mut f, b"4").unwrap();
+            drop(f);
+            settle();
+            assert_eq!(last(), "v4");
+            let n = seen.borrow().len();
+            fs::rename(&doc, dir.join("d.md~")).unwrap(); // renamed away (vim backup), another file saved
+            fs::write(dir.join("other.md"), "x").unwrap();
+            settle();
+            assert_eq!(seen.borrow().len(), n);
+            fs::write(&doc, "v5").unwrap(); // then the new doc written
+            settle();
+            assert_eq!(last(), "v5");
+        })
+        .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tree_events_need_a_doc_or_folder() {
+        use gio::FileMonitorEvent as E;
+        let dir = std::env::temp_dir().join(format!("md-events-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("4913"), "").unwrap(); // vim's write test file
+        let hit = |e, p: &str, watched: bool| changes_tree(e, std::iter::once(dir.join(p)), |_| watched);
+        assert!(hit(E::Created, "x.md", false) && hit(E::Deleted, "x.MARKDOWN", false) && hit(E::Renamed, "x.md", false));
+        assert!(hit(E::Created, "sub", false) && hit(E::MovedOut, "gone", true));
+        assert!(!hit(E::Created, "4913", false) && !hit(E::Deleted, "gone", false) && !hit(E::ChangesDoneHint, "x.md", false));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
