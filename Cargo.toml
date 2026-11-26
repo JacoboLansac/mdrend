@@ -1,10 +1,10 @@
 [package]
-name = "mdrend"
+name = "mdrender"
 version = "0.1.0"
 edition = "2024"
 description = "Fast GitHub-style markdown viewer for Linux, with a file tree and live reload"
 license = "MIT"
-repository = "https://github.com/JacoboLansac/mdrend"
+repository = "https://github.com/JacoboLansac/mdrender"
 readme = "README.md"
 keywords = ["markdown", "viewer", "gtk", "webkit"]
 categories = ["command-line-utilities", "gui"]

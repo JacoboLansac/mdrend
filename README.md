@@ -1,4 +1,4 @@
-# mdrend
+# mdrender
 
 `md` is a fast markdown viewer for Linux. It renders files the way GitHub does and shows a tree of the other
 markdown files next to them.
@@ -25,7 +25,7 @@ sudo apt install libwebkit2gtk-4.1-dev
 Then install `md` into `~/.cargo/bin`:
 
 ```sh
-cargo install --git https://github.com/JacoboLansac/mdrend --locked
+cargo install mdrender --locked
 ```
 
 From a clone, `just install` also installs a desktop entry and a dock icon. It needs [just](https://github.com/casey/just).

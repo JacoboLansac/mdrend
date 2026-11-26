@@ -4,7 +4,7 @@ Name=md
 Comment=GitHub-style markdown viewer
 # `just install` replaces Exec and Icon with absolute paths.
 Exec=md %f
-Icon=mdrend
+Icon=mdrender
 Terminal=false
 # Gives the dock icon to windows of the `md` binary; hidden from the app grid.
 StartupWMClass=md
