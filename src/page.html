@@ -1,5 +1,5 @@
 <!doctype html>
-<html class="{{theme}}">
+<html class="{{theme}}" data-stamp="{{stamp}}">
 <head>
 <meta charset="utf-8">
 <!-- Markdown may hold raw HTML: only our nonced script runs, no inline handlers, fetches stay local. -->
@@ -8,12 +8,16 @@
 <title>{{title}}</title>
 <style>
 {{css}}
+/* GitHub's font lists start with Mac and Windows fonts. On Linux each missing one costs WebKit a fontconfig lookup
+   per font size and weight (~200 ms on a typical README), so start at the first font Linux has. */
+.markdown-body { font-family: "Noto Sans", Helvetica, Arial, sans-serif; }
+.markdown-body tt, .markdown-body code, .markdown-body kbd, .markdown-body samp, .markdown-body pre { font-family: "Liberation Mono", monospace; }
 :root { --bg: #ffffff; --fg: #1f2328; --border: #d1d9e0; --active: #818b981f; --focus: #0969da; }
 .dark { --bg: #0d1117; --fg: #f0f6fc; --border: #3d444d; --active: #656c7633; --focus: #4493f8; color-scheme: dark; }
 html, body { margin: 0; height: 100%; }
 body { display: flex; background: var(--bg); }
 #tree { width: 260px; flex-shrink: 0; overflow: auto; padding: 8px 4px; box-sizing: border-box; border-right: 1px solid var(--border);
-  font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; color: var(--fg); }
+  font: 14px "Noto Sans", Helvetica, Arial, sans-serif; color: var(--fg); }
 #tree ul { list-style: none; margin: 0; padding-left: 12px; }
 #tree > ul { padding-left: 0; }
 #tree a, #tree summary { display: block; padding: 3px 8px; border-radius: 6px; color: inherit; text-decoration: none; white-space: nowrap; cursor: pointer; }
@@ -35,7 +39,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const isDoc = u => u.protocol === location.protocol && /\.(md|markdown)$/i.test(u.pathname);
   const same = (a, b) => decodeURIComponent(a.pathname) === decodeURIComponent(b.pathname);
   const byId = id => article.querySelector('#' + CSS.escape(id)); // doc headings only, not the shell's ids
-  let current;
+  let current = location.pathname === '/' ? null : location.href, stamp = document.documentElement.dataset.stamp;
 
   // Highlight the doc in the tree and expand its parent folders.
   function mark(u) {
@@ -44,17 +48,29 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   // Swap in another doc without reloading, so the tree keeps its state.
-  async function show(u) {
+  // With reload, re-renders the open doc and keeps the scroll position.
+  async function show(u, reload) {
     current = u.href;
     const res = await fetch(u.pathname + '?body');
     const html = await res.text();
     if (current !== u.href) return; // a newer request won
+    stamp = res.headers.get('x-stamp');
     base.href = u.href; // relative images/links resolve against the doc
     article.innerHTML = html;
+    if (reload) return;
     mark(u);
     const target = u.hash && byId(decodeURIComponent(u.hash.slice(1)));
     target ? target.scrollIntoView() : content.scrollTop = 0;
   }
+
+  // Live reload: poll the open doc's mtime and size, re-render when they change.
+  setInterval(async () => {
+    const u = current;
+    if (!u) return; // no doc open
+    const res = await fetch(new URL(u).pathname + '?stamp');
+    const s = res.ok && await res.text();
+    if (s && u === current && s !== stamp) show(new URL(u), true);
+  }, 300);
 
   // Every link goes through here: docs swap in, anchors scroll, the rest goes to Rust,
   // which opens web links in the browser and local images/PDFs in their app.

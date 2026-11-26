@@ -3,6 +3,8 @@ use std::fs;
 use std::hash::{BuildHasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
+use std::sync::LazyLock;
+use std::thread;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use tao::dpi::LogicalSize;
@@ -62,11 +64,15 @@ fn main() {
     };
 
     let dark = theme.unwrap_or_else(system_dark);
-    let shell = PAGE
-        .replace("{{theme}}", if dark { "dark" } else { "light" })
-        .replace("{{css}}", if dark { DARK } else { LIGHT })
-        .replace("{{nonce}}", &format!("{:x}", RandomState::new().hash_one(0)))
-        .replace("{{tree}}", &tree_html(&root));
+    // Big folders take a while to walk: walk while GTK and WebKit start, wait for it on the first request.
+    let tree_root = root.clone();
+    let tree = thread::spawn(move || tree_html(&tree_root));
+    let shell = LazyLock::new(move || {
+        PAGE.replace("{{theme}}", if dark { "dark" } else { "light" })
+            .replace("{{css}}", if dark { DARK } else { LIGHT })
+            .replace("{{nonce}}", &format!("{:x}", RandomState::new().hash_one(0)))
+            .replace("{{tree}}", &tree.join().unwrap())
+    });
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -87,6 +93,7 @@ fn main() {
             url => open_link(&ipc_root, url),
         })
         .with_url(url)
+        .with_background_color(if dark { (13, 17, 23, 255) } else { (255, 255, 255, 255) }) // no white flash before the first paint
         .build_gtk(window.default_vbox().unwrap())
         .unwrap_or_else(|e| die(&format!("md: cannot create webview: {e}"), 1));
 
@@ -136,6 +143,11 @@ fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Respo
     let Some(path) = local_path(root, uri_path).filter(|p| p.is_file() || p == root) else {
         return reply(404, "text/plain", b"Not found".to_vec());
     };
+    // Taken before the doc is read: a save during render then shows up as a change on the next poll.
+    let stamp = stamp(&path);
+    if query == Some("stamp") {
+        return reply(200, "text/plain", stamp.into_bytes());
+    }
     let body = if path == root {
         "<p>No document open. Pick one in the tree.</p>".to_owned()
     } else if let Some(ctype) = asset_type(&path) {
@@ -148,11 +160,14 @@ fn serve(root: &Path, shell: &str, uri_path: &str, query: Option<&str>) -> Respo
     };
     if query == Some("body") {
         // Plain text so a page load of this URL can't run the doc's HTML outside the app's CSP.
-        return reply(200, "text/plain; charset=utf-8", body.into_bytes());
+        let mut r = reply(200, "text/plain; charset=utf-8", body.into_bytes());
+        r.headers_mut().insert("x-stamp", stamp.parse().unwrap());
+        return r;
     }
     let title = esc(&name(&path));
-    // Content goes in last so text inside the doc can't fill the other placeholders.
-    let page = shell.replace("{{title}}", &title).replace("{{content}}", &body);
+    // Content goes in last so text inside the doc can't fill the other placeholders. The first {{stamp}} is on
+    // <html>, ahead of any file name in the tree.
+    let page = shell.replacen("{{stamp}}", &stamp, 1).replace("{{title}}", &title).replace("{{content}}", &body);
     reply(200, "text/html; charset=utf-8", page.into_bytes())
 }
 
@@ -187,6 +202,11 @@ fn url_path(root: &Path, url: &str) -> Option<PathBuf> {
 fn local_path(root: &Path, uri_path: &str) -> Option<PathBuf> {
     let rel = percent_decode_str(uri_path).decode_utf8_lossy();
     fs::canonicalize(root.join(rel.trim_start_matches('/'))).ok().filter(|p| p.starts_with(root))
+}
+
+/// Changes on every save (mtime and size); the page polls it for live reload.
+fn stamp(path: &Path) -> String {
+    fs::metadata(path).map(|m| format!("{:?} {}", m.modified().ok(), m.len())).unwrap_or_default()
 }
 
 /// Served raw instead of rendered.
@@ -378,9 +398,17 @@ mod tests {
         assert_eq!(serve(&root, PAGE, "/a", None).status(), 404);
         let body = serve(&root, PAGE, "/Z.md", Some("body"));
         assert_eq!(body.headers()["Content-Type"], "text/plain; charset=utf-8");
-        for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None)] {
+        for r in [body, serve(&root, PAGE, "/i.png", None), serve(&root, PAGE, "/link.md", None), serve(&root, PAGE, "/Z.md", Some("stamp"))] {
             assert_eq!(csp(&r).as_deref(), Some(LOCKED));
         }
+
+        // Live reload: page, body and poll carry the same stamp, and a save changes it.
+        let stamp = || String::from_utf8_lossy(serve(&root, PAGE, "/Z.md", Some("stamp")).body()).into_owned();
+        let s = stamp();
+        assert!(!s.is_empty() && html.contains(&format!("<html class=\"{{{{theme}}}}\" data-stamp=\"{s}\">")), "{s}");
+        assert_eq!(serve(&root, PAGE, "/Z.md", Some("body")).headers()["x-stamp"], s.as_str());
+        fs::write(root.join("Z.md"), "# hi again").unwrap();
+        assert_ne!(stamp(), s);
 
         // Page loads: docs under root only.
         let nav = |u: &str| navigate(&root, u);
