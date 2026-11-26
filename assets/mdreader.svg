@@ -1,15 +1,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3d444d"/>
-      <stop offset="1" stop-color="#151b23"/>
+      <stop offset="0" stop-color="#ff6a5c"/>
+      <stop offset="1" stop-color="#c4163a"/>
     </linearGradient>
   </defs>
   <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
   <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#ffffff" stroke-opacity=".12" stroke-width="2"/>
   <!-- An M whose right leg is the down arrow; after the Markdown mark (CC0, github.com/dcurtis/markdown-mark) -->
   <g transform="translate(11 23) scale(1.5)">
-    <path fill="#f0f6fc" d="M30 98V30h20l20 20 20-20v26L70 76 50 56v42z"/>
-    <path fill="#4493f8" d="M90 30h20v50h16l-26 30-26-30h16z"/>
+    <path fill="#ffffff" d="M30 98V30h20l20 20 20-20v26L70 76 50 56v42z"/>
+    <path fill="#ffd166" d="M90 30h20v50h16l-26 30-26-30h16z"/>
   </g>
 </svg>
