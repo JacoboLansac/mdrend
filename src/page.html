@@ -78,7 +78,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   document.addEventListener('keydown', e => {
-    if (e.ctrlKey && e.key === '1') { // focus the open doc, or the first item if its folder is collapsed
+    // Ctrl+1, or Esc outside the tree: focus the open doc's tree entry, or the first item if its folder is collapsed
+    if (e.ctrlKey && e.key === '1' || e.key === 'Escape' && !tree.contains(document.activeElement)) {
       e.preventDefault();
       const a = tree.querySelector('a.active');
       (a && shown(a) ? a : visible()[0])?.focus();

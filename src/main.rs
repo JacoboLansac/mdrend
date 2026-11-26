@@ -31,7 +31,7 @@ under the current directory (or the file's folder if it is outside it).
 With <dir>, opens the tree of <dir> and no document.
 The theme follows the system unless --light or --dark is given.
 
-Keys: Ctrl+1 tree, Ctrl+2 document, Ctrl+W or Ctrl+Q quit. In the tree:
+Keys: Ctrl+1 or Esc tree, Ctrl+2 document, Ctrl+W or Ctrl+Q quit. In the tree:
 Up/Down show docs, Left/Right fold folders, Enter opens the doc and moves
 focus to it.";
 
