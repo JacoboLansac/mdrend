@@ -1,6 +1,6 @@
 icons := home_directory() / ".local/share/icons/hicolor/scalable/apps"
 # GNOME Shell caches icons by path, so the installed name changes with the content.
-icon := icons / "mdreader-" + replace_regex(sha256_file(justfile_directory() / "assets/mdreader.svg"), '^(.{8}).*$', '$1') + ".svg"
+icon := icons / "mdrend-" + replace_regex(sha256_file(justfile_directory() / "assets/mdrend.svg"), '^(.{8}).*$', '$1') + ".svg"
 
 # List recipes
 default:
@@ -17,15 +17,15 @@ build:
 # Build and install `md` into ~/.cargo/bin, with its desktop entry and dock icon
 install:
     cargo install --path . --locked
-    rm -f "{{icons}}"/mdreader.svg "{{icons}}"/mdreader-????????.svg
-    install -Dm644 assets/mdreader.svg "{{icon}}"
+    rm -f "{{icons}}"/mdrend.svg "{{icons}}"/mdrend-????????.svg
+    install -Dm644 assets/mdrend.svg "{{icon}}"
     mkdir -p ~/.local/share/applications
-    sed -e "s|^Exec=md|Exec=${CARGO_HOME:-$HOME/.cargo}/bin/md|" -e "s|^Icon=.*|Icon={{icon}}|" assets/mdreader.desktop > ~/.local/share/applications/mdreader.desktop
+    sed -e "s|^Exec=md|Exec=${CARGO_HOME:-$HOME/.cargo}/bin/md|" -e "s|^Icon=.*|Icon={{icon}}|" assets/mdrend.desktop > ~/.local/share/applications/mdrend.desktop
 
 # Remove the installed `md`, its desktop entry and icon
 uninstall:
-    rm -f ~/.local/share/applications/mdreader.desktop "{{icons}}"/mdreader.svg "{{icons}}"/mdreader-????????.svg
-    cargo uninstall mdreader
+    rm -f ~/.local/share/applications/mdrend.desktop "{{icons}}"/mdrend.svg "{{icons}}"/mdrend-????????.svg
+    cargo uninstall mdrend
 
 # Open a file with the dev build (path relative to where you call just)
 [no-cd]
