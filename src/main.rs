@@ -328,8 +328,11 @@ fn navigate(root: &Path, url: &str) -> bool {
 
 /// Clicked links the viewer can't show: web links go to the browser, local images/PDFs to their app.
 fn open_link(root: &Path, url: &str) {
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+    if url.starts_with("http://") || url.starts_with("https://") {
         open_external(url.as_ref());
+    } else if url.starts_with("mailto:") {
+        // Address only: some mail clients turn `?attach=<path>` into a local file attachment.
+        open_external(url.split('?').next().unwrap().as_ref());
     } else if let Some(p) = url_path(root, url).filter(|p| asset_type(p).is_some()) {
         open_external(p.as_os_str());
     }
