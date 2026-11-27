@@ -1,7 +1,21 @@
 # mdrender
 
-`md` is a fast markdown viewer for Linux. It renders files the way GitHub does and shows a tree of the other
-markdown files next to them.
+[![crates.io](https://img.shields.io/crates/v/mdrender.svg)](https://crates.io/crates/mdrender)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+`md` is a simple, fast markdown viewer for Linux. Open a folder, and read every markdown file in it the way GitHub
+shows it.
+
+<!-- Screenshot: add assets/screenshot.png and uncomment.
+![md showing a README next to the file tree](assets/screenshot.png)
+-->
+
+Built to review what AI agents write: plans, specs, reports and notes are markdown, and `md` shows only markdown.
+
+- **Simple:** one command, one window. No browser, no server, no editor, no settings.
+- **Fast:** a native window that opens at once and reloads the moment an agent saves a file.
+- **Keyboard first:** move through the files and scroll with shortcuts, no mouse needed.
+- **Markdown only:** the tree lists markdown files and nothing else, so new docs are easy to spot.
 
 ## Features
 
@@ -16,13 +30,15 @@ markdown files next to them.
 
 ## Install
 
-You need Linux, a recent stable Rust toolchain and the WebKitGTK development files. On Debian or Ubuntu:
+`md` needs Linux, [Rust](https://rustup.rs) and the WebKitGTK development files. Install WebKitGTK first:
 
 ```sh
-sudo apt install libwebkit2gtk-4.1-dev
+sudo apt install libwebkit2gtk-4.1-dev   # Debian, Ubuntu
+sudo dnf install webkit2gtk4.1-devel     # Fedora
+sudo pacman -S webkit2gtk-4.1            # Arch
 ```
 
-Then install `md` into `~/.cargo/bin`:
+Then install the `md` command into `~/.cargo/bin`:
 
 ```sh
 cargo install mdrender --locked
