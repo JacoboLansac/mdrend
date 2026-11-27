@@ -35,6 +35,37 @@ run file *flags:
 test:
     cargo test
 
+# Bump the version (patch, minor, major or X.Y.Z), test, tag, publish to crates.io and push. Run on master.
+publish level="patch":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(git branch --show-current)" = master ] || { echo "publish: not on master"; exit 1; }
+    [ -z "$(git status --porcelain)" ] || { echo "publish: uncommitted changes"; exit 1; }
+    git fetch -q origin master
+    git merge-base --is-ancestor origin/master HEAD || { echo "publish: behind origin/master, pull first"; exit 1; }
+    cur=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    IFS=. read -r ma mi pa <<< "$cur"
+    case "{{level}}" in
+        major) new="$((ma + 1)).0.0" ;;
+        minor) new="$ma.$((mi + 1)).0" ;;
+        patch) new="$ma.$mi.$((pa + 1))" ;;
+        *) new="{{level}}" ;;
+    esac
+    [[ $new =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "publish: {{level}} is not patch, minor, major or X.Y.Z"; exit 1; }
+    read -rp "Publish mdrender $cur -> $new to crates.io? It cannot be undone. [y/N] " ok
+    [ "$ok" = y ] || exit 1
+    # Same version: publish the current one as is (the first release).
+    if [ "$new" != "$cur" ]; then
+        sed -i "0,/^version = \".*\"/s//version = \"$new\"/" Cargo.toml
+        cargo update --workspace --offline --quiet
+    fi
+    cargo test --locked
+    if [ "$new" != "$cur" ]; then git commit -qm "chore: release v$new" Cargo.toml Cargo.lock; fi
+    cargo publish --locked
+    # Tagged after the publish, so a failed publish can rerun with `just publish X.Y.Z`.
+    git tag "v$new"
+    git push origin master "v$new"
+
 # Re-download the GitHub markdown stylesheets (MIT, sindresorhus/github-markdown-css)
 update-css:
     for f in github-markdown-light.css github-markdown-dark.css; do curl -fsSL "https://raw.githubusercontent.com/sindresorhus/github-markdown-css/main/$f" -o "assets/$f"; done
