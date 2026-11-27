@@ -1490,7 +1490,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mdreader"
+name = "mdrender"
 version = "0.1.0"
 dependencies = [
  "comrak",
