@@ -6,9 +6,7 @@
 `md` is a simple, fast markdown viewer for Linux. Open a folder, and read every markdown file in it the way GitHub
 shows it.
 
-<!-- Screenshot: add assets/screenshot.png and uncomment.
 ![md showing a README next to the file tree](assets/screenshot.png)
--->
 
 Built to review what AI agents write: plans, specs, reports and notes are markdown, and `md` shows only markdown.
 
